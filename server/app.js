@@ -210,9 +210,11 @@ function createApp() {
   });
 
   // Historical sample migration: plan the source/target JSON Pointer moves
-  // by path depth, apply them atomically per sample (conflicts keep the
-  // sample untouched with reasons), then validate every result against the
-  // current schema with Ajv and group into success / conflict / invalid.
+  // by path depth, apply them atomically per sample (array indexes address
+  // pre-migration positions; source vacancies compact after all writes;
+  // conflicts keep the sample untouched with reasons), then validate every
+  // result against the current schema with Ajv and group into
+  // success / conflict / invalid.
   app.post("/api/migrate", (req, res) => {
     const { baselineSchema, currentSchema, samples, mappings } = req.body || {};
     try {

@@ -18,8 +18,8 @@
  *
  *   - source removals run deepest first (so a descendant move happens before
  *     its ancestor subtree is removed); numeric array siblings of the same
- *     depth are removed from the highest index down, so earlier removals do
- *     not shift the indexes of later ones;
+ *     depth are listed from the highest index down (a deterministic order —
+ *     removals no longer shift indexes, see VACANT below);
  *   - target writes run shallowest first, so parent containers exist before
  *     their children are written.
  *
@@ -28,6 +28,13 @@
  *   - every present source is extracted (deep-cloned) into an operation list
  *     before any target is written, which makes swaps (/a -> /b, /b -> /a)
  *     and chains (/a -> /b, /b -> /c) work;
+ *   - extracting an array element leaves a VACANT marker in its slot instead
+ *     of splicing, so every array index — at any nesting level — keeps
+ *     addressing the SAME pre-migration element for the whole operation;
+ *     only after ALL target writes are done are the still-vacant slots
+ *     compacted away (slots a target write refilled survive). This is what
+ *     makes in-array swaps (/arr/0 <-> /arr/1) lossless: untouched elements
+ *     such as a trailing "C" are never shifted under a later write;
  *   - a pre-existing target that is not removed by an active source move
  *     (the target itself or an ancestor of it was an extracted source) is a
  *     conflict, and so are two operations ending up at the same concrete
@@ -64,6 +71,10 @@ const ARRAY_INDEX = /^(0|[1-9]\d*)$/;
 
 const MISSING = Symbol("missing");
 const UNSET = Symbol("unset");
+// Slot marker left behind when an array element is moved out: the array
+// keeps its pre-migration length and indexing until every target write is
+// done, then still-vacant slots are compacted away in one pass.
+const VACANT = Symbol("vacant");
 
 const ajv = new Ajv2020({ allErrors: true, strict: false, ownProperties: true });
 
@@ -107,8 +118,11 @@ function locate(node, segments) {
 
 /**
  * Remove and return the value at parsed segments. The caller already checked
- * the location resolves. Numeric array siblings are removed deepest/highest
- * first by the plan, so indexes never shift under an upcoming removal.
+ * the location resolves. Array elements are NOT spliced out: the slot is
+ * marked VACANT so every sibling keeps its pre-migration index while the
+ * remaining sources are extracted and every target is written; the vacancy
+ * is compacted away (or kept, when a target write refills it) only after
+ * the last write of this sample.
  */
 function extract(root, segments) {
   if (segments.length === 0) return { root: UNSET, value: root };
@@ -119,7 +133,7 @@ function extract(root, segments) {
   if (Array.isArray(node)) {
     const index = Number(last);
     value = node[index];
-    node.splice(index, 1);
+    node[index] = VACANT;
   } else {
     value = node[last];
     delete node[last];
@@ -160,6 +174,9 @@ function applyWrite(holder, segments, mappingIndex, value, written) {
         node.push(appended);
       }
       const child = node[index];
+      if (child === VACANT) {
+        return `目标路径中途 ${displayPointer(segments.slice(0, i + 1))} 的元素已被移出（空位待压缩），无法继续向下写入`;
+      }
       if (child === null || typeof child !== "object") {
         return `目标路径中途 ${displayPointer(segments.slice(0, i + 1))} 为标量，无法继续向下写入`;
       }
@@ -191,6 +208,8 @@ function applyWrite(holder, segments, mappingIndex, value, written) {
         return `目标数组下标 ${index} 越界（当前长度 ${node.length}，仅允许替换已有元素或在末尾追加）`;
       }
       concrete = segments;
+      // index < length overwrites the slot — exactly what refills a VACANT
+      // slot left by a source move (in-array swaps rely on this).
       if (index === node.length) node.push(value);
       else node[index] = value;
     } else {
@@ -216,6 +235,33 @@ function applyWrite(holder, segments, mappingIndex, value, written) {
 /** Container kind implied by the child segment about to be placed inside. */
 function makeContainerFor(childSegment) {
   return ARRAY_INDEX.test(childSegment) || childSegment === "-" ? [] : {};
+}
+
+/**
+ * Remove the VACANT slots still left in every array (recursively) after all
+ * target writes of one sample completed. Slots a write refilled hold real
+ * values again and are kept; every other element keeps its relative order,
+ * so nothing unmoved is lost or shifted under a later write. Runs over the
+ * whole document, including moved subtrees that carried a vacancy along.
+ */
+function compactVacancies(node) {
+  if (Array.isArray(node)) {
+    const compacted = [];
+    for (const element of node) {
+      if (element === VACANT) continue;
+      compacted.push(compactVacancies(element));
+    }
+    return compacted;
+  }
+  if (node !== null && typeof node === "object") {
+    for (const key of Object.keys(node)) {
+      const value = node[key];
+      if (value !== null && typeof value === "object") {
+        setOwnKey(node, key, compactVacancies(value));
+      }
+    }
+  }
+  return node;
 }
 
 function mapErrors(validate) {
@@ -321,10 +367,12 @@ function planMappings(mappings) {
 /**
  * Plan the global operation order (independent of any concrete sample).
  *
- * Source removals: deepest first; numeric array siblings of the same parent
- * come off from the highest index down so removals do not shift upcoming
- * indexes; everything else keeps the configured (stable) order. Target
- * writes: shallowest first, ties keeping the configured order.
+ * Source removals: deepest first, so a descendant is lifted out before its
+ * ancestor subtree moves. Array slots are vacated in place (see VACANT), so
+ * removals never shift indexes; same-parent numeric siblings are still
+ * listed from the highest index down to keep the plan deterministic.
+ * Everything else keeps the configured (stable) order. Target writes:
+ * shallowest first, ties keeping the configured order.
  */
 function buildOperationOrder(parsed) {
   const indices = parsed.map((_, index) => index);
@@ -533,7 +581,7 @@ function migrateSamples({ baselineSchema, currentSchema, samples, mappings }) {
       };
     }
 
-    const migrated = holder.root;
+    const migrated = compactVacancies(holder.root);
     const currentValid = validateCurrent(migrated);
     const status = currentValid ? "success" : "invalid";
     summary[status] += 1;

@@ -723,6 +723,33 @@ test("POST /api/migrate supports defaults, arrays (-) and depth-planned parent/c
   assert.equal(res.data.plan.sourceRemovals[0].pointer, "/meta/tags/0");
 });
 
+test("POST /api/migrate swaps array elements by pre-migration indexes (no element lost)", async () => {
+  const res = await post("/api/migrate", {
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings: [
+      { from: "/arr/0", to: "/arr/1" },
+      { from: "/arr/1", to: "/arr/0" },
+    ],
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.summary.success, 1);
+  // The untouched "C" survives; the two swapped slots trade values.
+  assert.deepEqual(res.data.samples[0].after, { arr: ["B", "A", "C"] });
+
+  // Mapping input order must not change the result.
+  const reversed = await post("/api/migrate", {
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings: [
+      { from: "/arr/1", to: "/arr/0" },
+      { from: "/arr/0", to: "/arr/1" },
+    ],
+  });
+  assert.equal(reversed.status, 200);
+  assert.deepEqual(reversed.data.samples[0].after, { arr: ["B", "A", "C"] });
+});
+
 test("POST /api/migrate rejects invalid mappings with 422 and details", async () => {
   const badPointer = await post("/api/migrate", {
     currentSchema: {},

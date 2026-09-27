@@ -113,7 +113,7 @@ test("migrateSamples handles array elements: high indexes first, - append, fresh
       { from: "/list/0", to: "/rest/-" },
     ],
   });
-  // /list/1 (20) removed first while indexes are still valid, then /list/0 (10).
+  // /list/1 (20) and /list/0 (10) come out as holes; compaction leaves [30].
   assert.deepEqual(result.samples[0].after, { list: [30], one: 20, rest: [10] });
 
   const appended = migrateSamples({
@@ -130,6 +130,190 @@ test("migrateSamples handles array elements: high indexes first, - append, fresh
     mappings: [{ from: "/x", to: "/items/0" }],
   });
   assert.deepEqual(fresh.samples[0].after, { items: [7] });
+});
+
+test("migrateSamples swaps array elements by pre-migration indexes without losing siblings", () => {
+  const mappings = [
+    { from: "/arr/0", to: "/arr/1" },
+    { from: "/arr/1", to: "/arr/0" },
+  ];
+  const result = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings,
+  });
+  // The untouched "C" keeps its value; only the two swapped slots change.
+  assert.deepEqual(result.samples[0].after, { arr: ["B", "A", "C"] });
+
+  // Mapping input order must not change the outcome.
+  const reversed = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings: [...mappings].reverse(),
+  });
+  assert.deepEqual(reversed.samples[0].after, { arr: ["B", "A", "C"] });
+});
+
+test("migrateSamples resolves nested array indexes against pre-migration positions", () => {
+  const swap = migrateSamples({
+    currentSchema: {},
+    samples: [{ a: [["A", "B"], ["C", "D"]] }],
+    mappings: [
+      { from: "/a/0/0", to: "/a/0/1" },
+      { from: "/a/0/1", to: "/a/0/0" },
+    ],
+  });
+  assert.deepEqual(swap.samples[0].after, { a: [["B", "A"], ["C", "D"]] });
+
+  // Moving out of a nested array into another one: hole compacts, append lands.
+  const across = migrateSamples({
+    currentSchema: {},
+    samples: [{ a: [["A", "B"], ["C"]] }],
+    mappings: [{ from: "/a/0/0", to: "/a/1/-" }],
+  });
+  assert.deepEqual(across.samples[0].after, { a: [["B"], ["C", "A"]] });
+});
+
+test("migrateSamples supports moving out and writing back into the same array", () => {
+  const mappings = [
+    { from: "/arr/0", to: "/arr/2" }, // refills the hole /arr/2 leaves
+    { from: "/arr/2", to: "/x" },
+  ];
+  const result = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings,
+  });
+  assert.deepEqual(result.samples[0].after, { arr: ["B", "A"], x: "C" });
+
+  // Same combination, mappings given in the opposite order.
+  const reversed = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings: [...mappings].reverse(),
+  });
+  assert.deepEqual(reversed.samples[0].after, { arr: ["B", "A"], x: "C" });
+});
+
+test("migrateSamples compacts unrefilled holes after all writes, keeping order", () => {
+  const result = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings: [
+      { from: "/arr/0", to: "/x" },
+      { from: "/arr/1", to: "/y" },
+    ],
+  });
+  assert.deepEqual(result.samples[0].after, { arr: ["C"], x: "A", y: "B" });
+
+  // A hole carried inside a moved subtree is compacted as well.
+  const nested = migrateSamples({
+    currentSchema: {},
+    samples: [{ a: [["A", "B", "C"]] }],
+    mappings: [
+      { from: "/a/0/1", to: "/x" },
+      { from: "/a/0", to: "/y" },
+    ],
+  });
+  assert.deepEqual(nested.samples[0].after, { a: [], x: "B", y: ["A", "C"] });
+
+  // Rotating via "-" append: the hole drops out, the appended value stays last.
+  const rotated = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B", "C"] }],
+    mappings: [{ from: "/arr/0", to: "/arr/-" }],
+  });
+  assert.deepEqual(rotated.samples[0].after, { arr: ["B", "C", "A"] });
+});
+
+test("migrateSamples lets a target write refill a hole, even through it", () => {
+  // /arr/0 is extracted, then a default refills exactly that slot: it stays.
+  const refilled = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B"] }],
+    mappings: [
+      { from: "/arr/0", to: "/x" },
+      { from: "/missing", to: "/arr/0", default: "D" },
+    ],
+  });
+  assert.deepEqual(refilled.samples[0].after, { arr: ["D", "B"], x: "A" });
+
+  // A write whose path runs THROUGH a hole auto-creates the container there.
+  const through = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: [{ a: 1 }], y: 7 }],
+    mappings: [
+      { from: "/arr/0", to: "/x" },
+      { from: "/y", to: "/arr/0/b" },
+    ],
+  });
+  assert.deepEqual(through.samples[0].after, { arr: [{ b: 7 }], x: { a: 1 } });
+});
+
+test("migrateSamples still conflicts when two active mappings write one array slot", () => {
+  const original = { a: 1, b: 2, arr: ["X", "Y"] };
+  const result = migrateSamples({
+    currentSchema: {},
+    samples: [original],
+    mappings: [
+      { from: "/a", to: "/arr/0" },
+      { from: "/b", to: "/arr/0" },
+    ],
+  });
+  const item = result.samples[0];
+  assert.equal(item.status, "conflict");
+  assert.equal(item.after, null);
+  assert.deepEqual(item.before, { a: 1, b: 2, arr: ["X", "Y"] });
+  assert.ok(original.a === 1 && original.b === 2 && original.arr.length === 2);
+
+  // Same slot, but the target only exists after the moves: the write-order
+  // collision detector reports it (and still keeps the sample untouched).
+  const collision = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B"], x: 1, y: 2 }],
+    mappings: [
+      { from: "/y", to: "/arr/-" }, // "-" resolves to index 2 first…
+      { from: "/x", to: "/arr/2" }, // …then the explicit index lands on it
+    ],
+  });
+  assert.equal(collision.samples[0].status, "conflict");
+  assert.match(collision.samples[0].reasons[0], /写入位置冲突/);
+  assert.deepEqual(collision.samples[0].before, { arr: ["A", "B"], x: 1, y: 2 });
+});
+
+test("migrateSamples refuses to overwrite an unmoved array element", () => {
+  const result = migrateSamples({
+    currentSchema: {},
+    samples: [{ arr: ["A", "B"] }],
+    mappings: [{ from: "/arr/0", to: "/arr/1" }], // /arr/1 ("B") is not moved
+  });
+  const item = result.samples[0];
+  assert.equal(item.status, "conflict");
+  assert.equal(item.after, null);
+  assert.deepEqual(item.before, { arr: ["A", "B"] });
+  assert.match(item.reasons[0], /已存在值/);
+});
+
+test("migrateSamples classifies array moves with Ajv like any other result", () => {
+  const result = migrateSamples({
+    currentSchema: {
+      type: "object",
+      properties: { arr: { type: "array", items: { type: "string" }, minItems: 3 } },
+      required: ["arr"],
+    },
+    samples: [
+      { arr: ["A", "B", "C"] }, // swap keeps 3 strings -> success
+      { arr: ["A", 1, "C"] }, // swap keeps the number -> invalid
+    ],
+    mappings: [
+      { from: "/arr/0", to: "/arr/1" },
+      { from: "/arr/1", to: "/arr/0" },
+    ],
+  });
+  assert.deepEqual(result.summary, { success: 1, conflict: 0, invalid: 1 });
+  assert.deepEqual(result.samples[0].after, { arr: ["B", "A", "C"] });
+  assert.deepEqual(result.samples[1].after, { arr: [1, "A", "C"] });
+  assert.equal(result.samples[1].current.valid, false);
 });
 
 test("migrateSamples fills a default only when the source is missing", () => {

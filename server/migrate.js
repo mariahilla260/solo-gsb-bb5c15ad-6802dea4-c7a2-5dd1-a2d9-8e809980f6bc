@@ -18,8 +18,9 @@
  *
  *   - source removals run deepest first (so a descendant move happens before
  *     its ancestor subtree is removed); numeric array siblings of the same
- *     depth are removed from the highest index down, so earlier removals do
- *     not shift the indexes of later ones;
+ *     depth come off from the highest index down — a deterministic, readable
+ *     plan only, since removals leave tombstone holes (see below) and never
+ *     shift the indexes of upcoming operations;
  *   - target writes run shallowest first, so parent containers exist before
  *     their children are written.
  *
@@ -28,6 +29,16 @@
  *   - every present source is extracted (deep-cloned) into an operation list
  *     before any target is written, which makes swaps (/a -> /b, /b -> /a)
  *     and chains (/a -> /b, /b -> /c) work;
+ *   - array indexes at EVERY level address the pre-migration element
+ *     positions: removing a source from an array leaves a tombstone hole
+ *     instead of splicing, so later removals and all target writes still
+ *     resolve to the original slots — swapping /arr/0 and /arr/1 of
+ *     ["A","B","C"] yields ["B","A","C"], the untouched C is never lost,
+ *     and the mapping order cannot change these outcomes;
+ *   - once ALL target writes are done, the holes left over in arrays are
+ *     compacted away in a single recursive pass (holes carried inside a
+ *     moved subtree included); a hole a target write refilled is ordinary
+ *     data again and stays put;
  *   - a pre-existing target that is not removed by an active source move
  *     (the target itself or an ancestor of it was an extracted source) is a
  *     conflict, and so are two operations ending up at the same concrete
@@ -64,6 +75,10 @@ const ARRAY_INDEX = /^(0|[1-9]\d*)$/;
 
 const MISSING = Symbol("missing");
 const UNSET = Symbol("unset");
+// Tombstone left behind when a source is extracted from an array: the slot
+// keeps its pre-migration index (no splice, no shifting) until compactHoles
+// reclaims the still-empty holes after every target write completed.
+const HOLE = Symbol("hole");
 
 const ajv = new Ajv2020({ allErrors: true, strict: false, ownProperties: true });
 
@@ -107,8 +122,10 @@ function locate(node, segments) {
 
 /**
  * Remove and return the value at parsed segments. The caller already checked
- * the location resolves. Numeric array siblings are removed deepest/highest
- * first by the plan, so indexes never shift under an upcoming removal.
+ * the location resolves. Array elements are replaced with a HOLE tombstone
+ * (NOT spliced out), so every later removal and every target write keeps
+ * resolving array indexes against the pre-migration element positions;
+ * compactHoles reclaims the leftover holes once all writes are done.
  */
 function extract(root, segments) {
   if (segments.length === 0) return { root: UNSET, value: root };
@@ -119,7 +136,7 @@ function extract(root, segments) {
   if (Array.isArray(node)) {
     const index = Number(last);
     value = node[index];
-    node.splice(index, 1);
+    node[index] = HOLE;
   } else {
     value = node[last];
     delete node[last];
@@ -128,10 +145,39 @@ function extract(root, segments) {
 }
 
 /**
+ * Reclaim the HOLE tombstones source removals left in arrays, recursively.
+ * Runs once per sample AFTER every target write completed: a hole a write
+ * refilled is ordinary data again and survives; only still-empty slots drop
+ * out, shifting the survivors left to close the gaps. Holes carried inside
+ * a moved subtree (an inner source was extracted before its ancestor array
+ * moved) are compacted as well.
+ */
+function compactHoles(node) {
+  if (Array.isArray(node)) {
+    let write = 0;
+    for (let read = 0; read < node.length; read += 1) {
+      const item = node[read];
+      if (item === HOLE) continue;
+      compactHoles(item);
+      node[write] = item;
+      write += 1;
+    }
+    node.length = write;
+    return;
+  }
+  if (isPlainObject(node)) {
+    for (const key of Object.keys(node)) compactHoles(node[key]);
+  }
+}
+
+/**
  * Write `value` at parsed segments, auto-creating missing intermediate
  * containers (array for a canonical-index / "-" child, object otherwise).
- * Returns an error reason string or null on success. Mutates `holder.root`,
- * including (re)creating the root after a whole-root source move.
+ * Array indexes address pre-migration element positions: a HOLE tombstone
+ * counts as an empty slot — writing over it (or through it) refills the
+ * hole, which then survives the final compaction. Returns an error reason
+ * string or null on success. Mutates `holder.root`, including (re)creating
+ * the root after a whole-root source move.
  *
  * `written` maps concrete path strings to the mapping index that placed them;
  * it turns a second write to the same location into a conflict (two "-"
@@ -159,7 +205,13 @@ function applyWrite(holder, segments, mappingIndex, value, written) {
         const appended = makeContainerFor(nextSegment);
         node.push(appended);
       }
-      const child = node[index];
+      let child = node[index];
+      if (child === HOLE) {
+        // A source move emptied this slot; the write refills it with a fresh
+        // container, and the refilled slot survives the final compaction.
+        child = makeContainerFor(nextSegment);
+        node[index] = child;
+      }
       if (child === null || typeof child !== "object") {
         return `目标路径中途 ${displayPointer(segments.slice(0, i + 1))} 为标量，无法继续向下写入`;
       }
@@ -321,10 +373,12 @@ function planMappings(mappings) {
 /**
  * Plan the global operation order (independent of any concrete sample).
  *
- * Source removals: deepest first; numeric array siblings of the same parent
- * come off from the highest index down so removals do not shift upcoming
- * indexes; everything else keeps the configured (stable) order. Target
- * writes: shallowest first, ties keeping the configured order.
+ * Source removals: deepest first (a descendant comes off before its ancestor
+ * subtree moves); numeric array siblings of the same parent are listed from
+ * the highest index down. The index ordering is cosmetic — removals leave
+ * HOLE tombstones instead of splicing, so indexes never shift under an
+ * upcoming removal either way. Target writes: shallowest first, ties keeping
+ * the configured order.
  */
 function buildOperationOrder(parsed) {
   const indices = parsed.map((_, index) => index);
@@ -509,6 +563,13 @@ function migrateSamples({ baselineSchema, currentSchema, samples, mappings }) {
           break;
         }
       }
+    }
+
+    // Phase C: only after EVERY target write completed, compact the holes
+    // source removals left in arrays (recursively). Holes a write refilled
+    // are kept; the rest drop out without disturbing the survivors' order.
+    if (reasons.length === 0) {
+      compactHoles(holder.root);
     }
 
     const baseline = validateBaseline
